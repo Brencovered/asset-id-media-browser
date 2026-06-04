@@ -235,24 +235,26 @@ function computeStopInventory(
     }
   }
 
-  // Inventory = mode of non-zero counts per category
-  // This is the most physically accurate: ignore misses (zeros), take the most
-  // common count seen when the component was actually visible = true quantity on pole
+  // Inventory = "smart max" per category:
+  // - Find the highest count seen in at least 2 images (confirmed by multiple angles)
+  // - If no count appears twice, use the single non-zero observation
+  // - This correctly handles: dual crossarms (seen as 2 in multiple images = trust 2),
+  //   outlier overcounts (5 ties seen once vs 3 ties seen 4 times = trust 3),
+  //   and missed detections (zeros = model missed from that angle, ignore)
   const inventoryCounts: Record<string, number> = {};
   for (const [name, counts] of countsByCategory.entries()) {
     const nonZero = counts.filter(c => c > 0);
     if (!nonZero.length) continue;
-    // Calculate mode of non-zero counts
+    // Count frequency of each value
     const freq = new Map<number, number>();
     for (const c of nonZero) freq.set(c, (freq.get(c) ?? 0) + 1);
-    let modeVal = nonZero[0], modeFreq = 0;
-    for (const [val, f] of freq.entries()) {
-      // Prefer higher frequency; on tie, prefer the lower count (conservative)
-      if (f > modeFreq || (f === modeFreq && val < modeVal)) {
-        modeVal = val; modeFreq = f;
-      }
-    }
-    inventoryCounts[name] = modeVal;
+    // Find highest count seen in >= 2 images
+    const trusted = [...freq.entries()]
+      .filter(([, f]) => f >= 2)
+      .map(([v]) => v);
+    inventoryCounts[name] = trusted.length > 0
+      ? Math.max(...trusted)   // highest count confirmed by multiple images
+      : Math.max(...nonZero);  // only seen once — use it (single-angle component)
   }
 
   return { inventoryCounts, detectionTotals, canonicalImageCount: canonicalN };
