@@ -111,6 +111,42 @@ const CDN_BASE = "https://library.unleashlive.com/";
 const DEFAULT_TILE = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
 const MISSION_CLUSTER_RADIUS_M = 25; // images within 25m = same hover stop
 
+// Known Unleash Live Smart Inspect mission profiles
+// imagesPerStop = expected number of images captured per pole hover
+type MissionProfile = {
+  id: string;
+  label: string;
+  assetType: string;
+  widthM: number;
+  imagesPerStop: number;
+  description?: string;
+};
+
+const MISSION_PROFILES: MissionProfile[] = [
+  { id: "wide-standoff-4", label: "Wide standoff — 4 Images, dual-angle", assetType: "Distribution Pole", widthM: 10, imagesPerStop: 4, description: "Two positions at wider radius, two gimbal angles per position" },
+  { id: "wide-standoff-2", label: "Wide standoff — 2 Images", assetType: "Distribution Pole", widthM: 10, imagesPerStop: 2, description: "Two opposite angled photos from wider radius" },
+  { id: "wide-cross-9", label: "Wide cross — 9 Images", assetType: "Distribution Pole", widthM: 8, imagesPerStop: 9, description: "Wide cross pattern (5) plus four lower-corner captures" },
+  { id: "wide-cross-5", label: "Wide cross — 5 Images", assetType: "Distribution Pole", widthM: 7, imagesPerStop: 5, description: "Top-down reference plus four corner angled photos" },
+  { id: "wide-aligned-3", label: "Wide aligned — 3 Images", assetType: "Distribution Pole", widthM: 50, imagesPerStop: 3, description: "Three-point wide aligned image capture" },
+  { id: "tight-standoff-4", label: "Tight standoff — 4 Images, dual-angle", assetType: "Distribution Pole", widthM: 5, imagesPerStop: 4, description: "Two positions tight radius, two gimbal angles per position" },
+  { id: "tight-standoff-2", label: "Tight standoff — 2 Images, steep angle", assetType: "Distribution Pole", widthM: 5, imagesPerStop: 2, description: "Two opposite angled photos at tight radius, steeper gimbal" },
+  { id: "tight-cross-5", label: "Tight cross — 5 Images", assetType: "Distribution Pole", widthM: 4, imagesPerStop: 5, description: "Top-down plus four corner angled photos at smaller radius" },
+  { id: "spot-check-2-no-nadir", label: "Spot check — 2 Images, no nadir", assetType: "Distribution Pole", widthM: 8, imagesPerStop: 2, description: "Two opposite angled photos, no top-down shot" },
+  { id: "spot-check-1-nadir", label: "Spot check — 1 Image plus nadir", assetType: "Distribution Pole", widthM: 4, imagesPerStop: 2, description: "One top-down and one back corner photo" },
+  { id: "scan-10", label: "10 Images, scan", assetType: "Distribution Pole", widthM: 12, imagesPerStop: 14, description: "Advanced 10-point scanning pattern, multi-altitude" },
+  { id: "offset-tight-4", label: "Offset tight — 2+2 Images", assetType: "Distribution Pole", widthM: 8, imagesPerStop: 4, description: "Tight four-point with two 45° offset, nadir, departure" },
+  { id: "offset-4", label: "Offset — 2+2 Images", assetType: "Distribution Pole", widthM: 10, imagesPerStop: 4, description: "Standard four-point with two 45° offset, nadir, departure" },
+  { id: "grid-9", label: "Grid — 9 Images", assetType: "Distribution Pole", widthM: 23, imagesPerStop: 9, description: "Detailed 9-point grid for comprehensive inspection" },
+  { id: "circular-7", label: "Circular — 7 Images", assetType: "Distribution Pole", widthM: 5, imagesPerStop: 7, description: "Circular pattern, center point and 6 surrounding waypoints" },
+  { id: "aligned-4", label: "Aligned — 4 Images", assetType: "Distribution Pole", widthM: 10, imagesPerStop: 4, description: "Four-point aligned image capture" },
+  { id: "aligned-3-approach", label: "Aligned — 3 Images plus approach", assetType: "Distribution Pole", widthM: 20, imagesPerStop: 3, description: "Three-point aligned plus approach shot" },
+  { id: "si-dist-simple", label: "SI-Dist-Simple — 5 Images", assetType: "Distribution Pole", widthM: 10, imagesPerStop: 5 },
+  { id: "ir-si-simple", label: "IR-SI-Simple — 10 Images", assetType: "Distribution Pole", widthM: 11, imagesPerStop: 10, description: "New pathing, z value: -1" },
+  { id: "4-image-si", label: "4 Image SI", assetType: "Distribution Pole", widthM: 14, imagesPerStop: 4 },
+  { id: "rgb-ir-simple-v2", label: "RGB&IR-SI-Simple-v2 — 5 Images", assetType: "Distribution Pole", widthM: 8, imagesPerStop: 5 },
+  { id: "custom", label: "Custom / Unknown", assetType: "Any", widthM: 0, imagesPerStop: 0, description: "Manual — set expected images per stop below" },
+];
+
 const DefaultIcon = L.icon({
   iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
   iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
@@ -304,6 +340,9 @@ export default function App() {
   const [dedupOff, setDedupOff] = useState<Set<string>>(new Set());
   const [activeProfile, setActiveProfile] = useState<string>("all");
   const [search, setSearch] = useState("");
+  // Smart Inspect mission profile selection
+  const [selectedMissionProfileId, setSelectedMissionProfileId] = useState<string | null>(null);
+  const [customImagesPerStop, setCustomImagesPerStop] = useState<number>(5);
 
   const cocoRef = useRef<HTMLInputElement>(null);
   const geoRef = useRef<HTMLInputElement>(null);
@@ -387,6 +426,34 @@ export default function App() {
   // ── Mission stops (spatial clusters) ─────────────────────────────────────────
   const missionStops = useMemo(() => clusterIntoStops(filteredImageRecords), [filteredImageRecords]);
 
+  // ── Auto-detect mission profile from stop sizes ───────────────────────────────
+  // When a COCO loads, look at the modal stop image count and suggest the best matching profile
+  const autoDetectedProfileId = useMemo(() => {
+    if (!missionStops.length) return null;
+    // Find the most common stop size
+    const sizes = missionStops.map(s => s.images.length);
+    const freq = new Map<number, number>();
+    for (const s of sizes) freq.set(s, (freq.get(s) ?? 0) + 1);
+    const modalSize = [...freq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (!modalSize) return null;
+    // Find best matching profile by imagesPerStop
+    const match = MISSION_PROFILES.find(p => p.imagesPerStop === modalSize && p.id !== "custom");
+    return match?.id ?? null;
+  }, [missionStops]);
+
+  // Effective mission profile (user pick > auto-detect > null)
+  const effectiveMissionProfile = useMemo(() => {
+    const id = selectedMissionProfileId ?? autoDetectedProfileId;
+    if (!id) return null;
+    return MISSION_PROFILES.find(p => p.id === id) ?? null;
+  }, [selectedMissionProfileId, autoDetectedProfileId]);
+
+  const effectiveImagesPerStop = useMemo(() => {
+    if (!effectiveMissionProfile) return null;
+    if (effectiveMissionProfile.id === "custom") return customImagesPerStop;
+    return effectiveMissionProfile.imagesPerStop;
+  }, [effectiveMissionProfile, customImagesPerStop]);
+
   // ── Join stops (and images) to poles ─────────────────────────────────────────
   const joinedStops = useMemo((): MissionStop[] => {
     if (!missionStops.length || !polesIndex?.length || !poleGrid) return missionStops;
@@ -437,26 +504,46 @@ export default function App() {
         inventoryCounts: {}, detectionTotals: {},
       });
 
-    // Assign stops to assets
     for (const stop of joinedStops) {
       if (!stop.poleKey) continue;
       const asset = map.get(stop.poleKey);
       if (!asset) continue;
       asset.stops.push(stop);
-      for (const img of stop.images) {
-        asset.images.push(img);
-        const perImg: Record<string, number> = {};
+
+      // If we know the expected images per stop, only use the first N images
+      // (ordered by timestamp) for inventory — extras are likely duplicate passes
+      const expectedN = effectiveImagesPerStop;
+      const imagesToCount = expectedN && expectedN > 0
+        ? [...stop.images].sort((a, b) => (a.cocoImage.date_captured ?? 0) - (b.cocoImage.date_captured ?? 0)).slice(0, expectedN)
+        : stop.images;
+
+      for (const img of stop.images) asset.images.push(img);
+
+      // Inventory (deduped) uses only the canonical image set
+      const perImg: Record<string, number> = {};
+      for (const img of imagesToCount) {
+        const imgCounts: Record<string, number> = {};
         for (const ann of img.annotations) {
           const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
-          perImg[name] = (perImg[name] ?? 0) + 1;
+          imgCounts[name] = (imgCounts[name] ?? 0) + 1;
           asset.detectionTotals[name] = (asset.detectionTotals[name] ?? 0) + 1;
         }
-        for (const [k, v] of Object.entries(perImg))
-          asset.inventoryCounts[k] = Math.max(asset.inventoryCounts[k] ?? 0, v);
+        for (const [k, v] of Object.entries(imgCounts))
+          perImg[k] = Math.max(perImg[k] ?? 0, v);
       }
+      // Also tally raw totals from ALL images (even extras)
+      for (const img of stop.images) {
+        if (imagesToCount.includes(img)) continue; // already counted above
+        for (const ann of img.annotations) {
+          const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
+          asset.detectionTotals[name] = (asset.detectionTotals[name] ?? 0) + 1;
+        }
+      }
+      for (const [k, v] of Object.entries(perImg))
+        asset.inventoryCounts[k] = Math.max(asset.inventoryCounts[k] ?? 0, v);
     }
     return map;
-  }, [polesIndex, joinedStops, catMap]);
+  }, [polesIndex, joinedStops, catMap, effectiveImagesPerStop]);
 
   const assetsList = useMemo(() => Array.from(assetsMap.values())
     .sort((a, b) => {
@@ -526,7 +613,10 @@ export default function App() {
     stopsMatched: joinedStops.filter(s => !!s.poleKey).length,
     assetsWithImages: assetsList.filter(a => a.images.length > 0).length,
     sessionName: coco?.info?.sessionName,
-  }), [coco, missionStops, joinedStops, assetsList]);
+    profileLabel: effectiveMissionProfile?.label ?? null,
+    imagesPerStop: effectiveImagesPerStop,
+    autoDetected: !selectedMissionProfileId && !!autoDetectedProfileId,
+  }), [coco, missionStops, joinedStops, assetsList, effectiveMissionProfile, effectiveImagesPerStop, selectedMissionProfileId, autoDetectedProfileId]);
 
   // ── File upload handlers ─────────────────────────────────────────────────────
   const onLoadCoco = async (file: File) => {
@@ -559,7 +649,7 @@ export default function App() {
     setSearch(""); setSelectedPoleKey(null); setSelectedStopKey(null);
     setSelectedImage(null); setSelectedUnassigned(null);
     setManualOverrides({}); setLeftTab("stops"); setDedupOff(new Set());
-    setActiveProfile("all");
+    setActiveProfile("all"); setSelectedMissionProfileId(null); setCustomImagesPerStop(5);
   };
 
   const assignStop = (stop: MissionStop, poleKey: string, assetId: string, distM?: number) => {
@@ -641,27 +731,89 @@ export default function App() {
         </div>
       )}
 
-      {/* ── PROFILE / INSPECT BAR ────────────────────────────────────────────── */}
-      {coco && allProfiles.length > 0 && (
-        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 20px", background: "#1a2332", flexShrink: 0 }}>
-          <span style={{ ...monoLabel(9), color: "#7c8fa8" }}>Inspect Profile</span>
-          <div style={{ display: "flex", gap: 4 }}>
-            <button onClick={() => setActiveProfile("all")}
-              style={{ fontFamily: MONO, fontSize: 9, padding: "3px 10px", borderRadius: 2, border: `1px solid ${activeProfile === "all" ? C.accent : "#3a4a5c"}`, background: activeProfile === "all" ? "rgba(0,168,114,.15)" : "transparent", color: activeProfile === "all" ? C.accent : "#7c8fa8", cursor: "pointer" }}>
-              All
-            </button>
-            {allProfiles.map(id => (
-              <button key={id} onClick={() => setActiveProfile(id)}
-                style={{ fontFamily: MONO, fontSize: 9, padding: "3px 10px", borderRadius: 2, border: `1px solid ${activeProfile === id ? C.accent : "#3a4a5c"}`, background: activeProfile === id ? "rgba(0,168,114,.15)" : "transparent", color: activeProfile === id ? C.accent : "#7c8fa8", cursor: "pointer", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {id}
-              </button>
-            ))}
+      {/* ── MISSION PROFILE + INSPECT PROFILE BAR ────────────────────────── */}
+      {coco && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "6px 20px", background: "#1a2332", flexShrink: 0, flexWrap: "wrap" }}>
+
+          {/* Smart Inspect Mission Profile */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontFamily: MONO, fontSize: 9, color: "#7c8fa8", textTransform: "uppercase", letterSpacing: ".1em", whiteSpace: "nowrap" }}>Mission Profile</span>
+            <select
+              value={selectedMissionProfileId ?? (autoDetectedProfileId ? `__auto__${autoDetectedProfileId}` : "")}
+              onChange={e => {
+                const v = e.target.value;
+                if (v === "") setSelectedMissionProfileId(null);
+                else if (v.startsWith("__auto__")) setSelectedMissionProfileId(null);
+                else setSelectedMissionProfileId(v);
+              }}
+              style={{ fontFamily: MONO, fontSize: 10, background: "#252d3a", border: `1px solid ${selectedMissionProfileId ? C.accent : "#3a4a5c"}`, borderRadius: 2, color: selectedMissionProfileId ? C.accent : "#c5cde8", padding: "4px 8px", outline: "none", maxWidth: 260, cursor: "pointer" }}>
+              <option value="">— Select profile —</option>
+              {autoDetectedProfileId && !selectedMissionProfileId && (
+                <option value={`__auto__${autoDetectedProfileId}`} style={{ color: "#00a872" }}>
+                  ✓ Auto: {MISSION_PROFILES.find(p => p.id === autoDetectedProfileId)?.label}
+                </option>
+              )}
+              {MISSION_PROFILES.map(p => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+
+            {/* Profile badge */}
+            {effectiveMissionProfile && (
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, background: "rgba(0,168,114,.15)", border: "1px solid rgba(0,168,114,.3)", borderRadius: 2, padding: "2px 7px", color: C.accent, whiteSpace: "nowrap" }}>
+                  {effectiveMissionProfile.imagesPerStop > 0 ? `${effectiveImagesPerStop} img/stop` : "custom"}
+                </span>
+                {effectiveMissionProfile.widthM > 0 && (
+                  <span style={{ fontFamily: MONO, fontSize: 9, color: "#5a7090" }}>{effectiveMissionProfile.widthM}m radius</span>
+                )}
+                {autoDetectedProfileId && !selectedMissionProfileId && (
+                  <span style={{ fontFamily: MONO, fontSize: 8, color: "#5a7090" }}>auto-detected</span>
+                )}
+              </div>
+            )}
+
+            {/* Custom images per stop input */}
+            {effectiveMissionProfile?.id === "custom" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: "#7c8fa8" }}>img/stop</span>
+                <input type="number" min={1} max={20} value={customImagesPerStop}
+                  onChange={e => setCustomImagesPerStop(Math.max(1, +e.target.value))}
+                  style={{ width: 44, background: "#252d3a", border: `1px solid ${C.accent}`, borderRadius: 2, color: C.accent, fontFamily: MONO, fontSize: 10, padding: "3px 6px", outline: "none" }} />
+              </div>
+            )}
           </div>
+
+          <div style={{ width: 1, height: 20, background: "#2a3a4a", flexShrink: 0 }} />
+
+          {/* AI Inspect profile filter */}
+          {allProfiles.length > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontFamily: MONO, fontSize: 9, color: "#7c8fa8", textTransform: "uppercase", letterSpacing: ".1em", whiteSpace: "nowrap" }}>AI Profile</span>
+              <div style={{ display: "flex", gap: 3 }}>
+                <button onClick={() => setActiveProfile("all")}
+                  style={{ fontFamily: MONO, fontSize: 9, padding: "3px 9px", borderRadius: 2, border: `1px solid ${activeProfile === "all" ? C.accent : "#3a4a5c"}`, background: activeProfile === "all" ? "rgba(0,168,114,.15)" : "transparent", color: activeProfile === "all" ? C.accent : "#7c8fa8", cursor: "pointer" }}>
+                  All
+                </button>
+                {allProfiles.map(id => (
+                  <button key={id} onClick={() => setActiveProfile(id)}
+                    style={{ fontFamily: MONO, fontSize: 9, padding: "3px 9px", borderRadius: 2, border: `1px solid ${activeProfile === id ? C.accent : "#3a4a5c"}`, background: activeProfile === id ? "rgba(0,168,114,.15)" : "transparent", color: activeProfile === id ? C.accent : "#7c8fa8", cursor: "pointer", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {id}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div style={{ flex: 1 }} />
-          <span style={{ fontFamily: MONO, fontSize: 9, color: "#3a4a5c" }}>Max join</span>
-          <input type="number" value={maxJoinM} onChange={e => setMaxJoinM(Math.max(0, +e.target.value))}
-            style={{ width: 60, background: "#252d3a", border: "1px solid #3a4a5c", borderRadius: 2, color: "#c5cde8", fontFamily: MONO, fontSize: 10, padding: "3px 7px", outline: "none" }} />
-          <span style={{ fontFamily: MONO, fontSize: 9, color: "#3a4a5c" }}>m</span>
+
+          {/* Max join distance */}
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ fontFamily: MONO, fontSize: 9, color: "#3a4a5c", whiteSpace: "nowrap" }}>Max join</span>
+            <input type="number" value={maxJoinM} onChange={e => setMaxJoinM(Math.max(0, +e.target.value))}
+              style={{ width: 55, background: "#252d3a", border: "1px solid #3a4a5c", borderRadius: 2, color: "#c5cde8", fontFamily: MONO, fontSize: 10, padding: "3px 6px", outline: "none" }} />
+            <span style={{ fontFamily: MONO, fontSize: 9, color: "#3a4a5c" }}>m</span>
+          </div>
         </div>
       )}
 
@@ -884,13 +1036,41 @@ export default function App() {
 
                 {/* Stop summary */}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, padding: "10px 12px", borderBottom: `1px solid ${C.b1}` }}>
-                  {[["Images", selectedStop.images.length], ["Detections", selectedStop.images.reduce((s, r) => s + r.annotations.length, 0)], ["Join", fmtM(selectedStop.joinDistM)]].map(([l, v]) => (
+                  {[
+                    ["Images", selectedStop.images.length],
+                    ["Detections", selectedStop.images.reduce((s, r) => s + r.annotations.length, 0)],
+                    ["Join dist", fmtM(selectedStop.joinDistM)]
+                  ].map(([l, v]) => (
                     <div key={String(l)} style={{ background: C.s2, borderRadius: 3, padding: "6px 8px" }}>
                       <div style={{ ...monoLabel(8), marginBottom: 2 }}>{l}</div>
                       <div style={{ fontFamily: MONO, fontSize: 15, fontWeight: 700 }}>{v}</div>
                     </div>
                   ))}
                 </div>
+
+                {/* Profile vs actual image count */}
+                {effectiveMissionProfile && (
+                  <div style={{ padding: "8px 14px", borderBottom: `1px solid ${C.b1}`, background: (() => {
+                    const expected = effectiveImagesPerStop ?? 0;
+                    const actual = selectedStop.images.length;
+                    if (actual === expected) return "rgba(0,168,114,.05)";
+                    if (actual > expected) return "rgba(212,130,10,.05)";
+                    return "rgba(212,0,46,.05)";
+                  })() }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>
+                        Profile: <b style={{ color: C.text }}>{effectiveMissionProfile.label}</b>
+                      </span>
+                      {(() => {
+                        const expected = effectiveImagesPerStop ?? 0;
+                        const actual = selectedStop.images.length;
+                        if (actual === expected) return <span style={{ fontFamily: MONO, fontSize: 9, color: C.accent }}>✓ {actual}/{expected} images</span>;
+                        if (actual > expected) return <span style={{ fontFamily: MONO, fontSize: 9, color: C.warn }}>⚠ {actual} images ({actual - expected} extra — dedup applied)</span>;
+                        return <span style={{ fontFamily: MONO, fontSize: 9, color: C.danger }}>✕ {actual}/{expected} images (incomplete capture)</span>;
+                      })()}
+                    </div>
+                  </div>
+                )}
 
                 {/* Profile */}
                 {selectedStop.aiAppIds.length > 0 && (
