@@ -1156,6 +1156,9 @@ export default function App() {
                     </table>
                   )}
                 </div>
+
+                {/* AI Inspect Profiles */}
+                {selectedStop.aiAppIds.length > 0 && (
                   <div style={{ padding: "8px 14px", borderBottom: `1px solid ${C.b1}` }}>
                     <div style={{ ...monoLabel(), marginBottom: 5 }}>Inspect Profiles</div>
                     {selectedStop.aiAppIds.map(id => (
