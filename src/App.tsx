@@ -210,26 +210,49 @@ function computeStopInventory(
     : sorted.length;
   const canonical = sorted.slice(0, canonicalN);
 
-  const inventoryCounts: Record<string, number> = {};
+  // Build per-image count arrays for each category across canonical images
+  const countsByCategory = new Map<string, number[]>();
   const detectionTotals: Record<string, number> = {};
 
-  // Deduped inventory: max count seen in any single canonical image
   for (const img of canonical) {
     const perImg: Record<string, number> = {};
     for (const ann of img.annotations) {
       const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
       perImg[name] = (perImg[name] ?? 0) + 1;
     }
-    for (const [k, v] of Object.entries(perImg))
-      inventoryCounts[k] = Math.max(inventoryCounts[k] ?? 0, v);
+    for (const [name, cnt] of Object.entries(perImg)) {
+      if (!countsByCategory.has(name)) countsByCategory.set(name, []);
+      countsByCategory.get(name)!.push(cnt);
+      detectionTotals[name] = (detectionTotals[name] ?? 0) + cnt;
+    }
   }
 
-  // Raw totals across ALL images (including extras beyond canonical)
-  for (const img of stop.images) {
+  // Raw totals from extra images beyond canonical
+  for (const img of sorted.slice(canonicalN)) {
     for (const ann of img.annotations) {
       const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
       detectionTotals[name] = (detectionTotals[name] ?? 0) + 1;
     }
+  }
+
+  // Inventory = mode of non-zero counts per category
+  // This is the most physically accurate: ignore misses (zeros), take the most
+  // common count seen when the component was actually visible = true quantity on pole
+  const inventoryCounts: Record<string, number> = {};
+  for (const [name, counts] of countsByCategory.entries()) {
+    const nonZero = counts.filter(c => c > 0);
+    if (!nonZero.length) continue;
+    // Calculate mode of non-zero counts
+    const freq = new Map<number, number>();
+    for (const c of nonZero) freq.set(c, (freq.get(c) ?? 0) + 1);
+    let modeVal = nonZero[0], modeFreq = 0;
+    for (const [val, f] of freq.entries()) {
+      // Prefer higher frequency; on tie, prefer the lower count (conservative)
+      if (f > modeFreq || (f === modeFreq && val < modeVal)) {
+        modeVal = val; modeFreq = f;
+      }
+    }
+    inventoryCounts[name] = modeVal;
   }
 
   return { inventoryCounts, detectionTotals, canonicalImageCount: canonicalN };
