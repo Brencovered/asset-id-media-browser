@@ -12,10 +12,15 @@ type CocoImage = {
   coco_url?: string;
   flickr_url?: string;
   s3Path?: string;
+  // UL platform GPS fields (two naming conventions)
+  lat?: number | null;
+  lng?: number | null;
   gpslat?: number | null;
   gpslng?: number | null;
   width?: number;
   height?: number;
+  alt?: number;
+  date_captured?: number;
 };
 
 type CocoAnnotation = {
@@ -154,9 +159,10 @@ function getPoleLL(f: Feature<Geometry, any>): { lat?: number; lon?: number } {
 // ─── Image URL resolution ─────────────────────────────────────────────────────
 
 function resolveImageUrl(img: CocoImage): string | undefined {
+  // s3Path is the reliable source in UL exports — coco_url/flickr_url are often empty strings
+  if (img.s3Path) return CDN_BASE + img.s3Path;
   if (img.coco_url && img.coco_url.startsWith("http")) return img.coco_url;
   if (img.flickr_url && img.flickr_url.startsWith("http")) return img.flickr_url;
-  if (img.s3Path) return CDN_BASE + img.s3Path;
   return undefined;
 }
 
@@ -258,8 +264,9 @@ export default function App() {
       annsByImage.get(ann.image_id)!.push(ann);
     }
     return coco.images.map(img => {
-      const lat = safeNum(img.gpslat) ?? undefined;
-      const lon = safeNum(img.gpslng) ?? undefined;
+      // Support both UL export conventions: lat/lng (newer) and gpslat/gpslng (older)
+      const lat = safeNum(img.lat ?? img.gpslat) ?? undefined;
+      const lon = safeNum(img.lng ?? img.gpslng) ?? undefined;
       return {
         cocoImage: img,
         lat, lon,
