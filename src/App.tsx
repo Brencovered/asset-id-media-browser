@@ -86,6 +86,10 @@ type MissionStop = {
   lon: number;
   images: ImageRecord[];
   aiAppIds: string[];  // unique inspection profiles used
+  // computed inventory for this stop
+  inventoryCounts: Record<string, number>;   // deduped: max per image per cat
+  detectionTotals: Record<string, number>;   // raw sum across all images
+  canonicalImageCount: number;               // how many images used for dedup
   // join result
   poleKey?: string;
   assetId?: string;
@@ -192,7 +196,44 @@ function gridCandidates<T extends { x: number; y: number }>(idx: GridIdx<T>, x: 
   return out;
 }
 
-// ─── Spatial clustering: group images into mission stops ──────────────────────
+function computeStopInventory(
+  stop: Omit<MissionStop, "inventoryCounts" | "detectionTotals" | "canonicalImageCount">,
+  expectedImagesPerStop: number | null,
+  catMap: Map<number, string>
+): Pick<MissionStop, "inventoryCounts" | "detectionTotals" | "canonicalImageCount"> {
+  // Sort by timestamp, take first N for canonical set
+  const sorted = [...stop.images].sort(
+    (a, b) => (a.cocoImage.date_captured ?? 0) - (b.cocoImage.date_captured ?? 0)
+  );
+  const canonicalN = expectedImagesPerStop && expectedImagesPerStop > 0
+    ? Math.min(expectedImagesPerStop, sorted.length)
+    : sorted.length;
+  const canonical = sorted.slice(0, canonicalN);
+
+  const inventoryCounts: Record<string, number> = {};
+  const detectionTotals: Record<string, number> = {};
+
+  // Deduped inventory: max count seen in any single canonical image
+  for (const img of canonical) {
+    const perImg: Record<string, number> = {};
+    for (const ann of img.annotations) {
+      const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
+      perImg[name] = (perImg[name] ?? 0) + 1;
+    }
+    for (const [k, v] of Object.entries(perImg))
+      inventoryCounts[k] = Math.max(inventoryCounts[k] ?? 0, v);
+  }
+
+  // Raw totals across ALL images (including extras beyond canonical)
+  for (const img of stop.images) {
+    for (const ann of img.annotations) {
+      const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
+      detectionTotals[name] = (detectionTotals[name] ?? 0) + 1;
+    }
+  }
+
+  return { inventoryCounts, detectionTotals, canonicalImageCount: canonicalN };
+}
 // Simple greedy clustering: iterate images sorted by timestamp, start a new
 // cluster when an image is > MISSION_CLUSTER_RADIUS_M from the current centroid.
 
@@ -229,6 +270,9 @@ function clusterIntoStops(images: ImageRecord[]): MissionStop[] {
         lat, lon,
         images: [img],
         aiAppIds: appId ? [appId] : [],
+        inventoryCounts: {},
+        detectionTotals: {},
+        canonicalImageCount: 0,
       });
     }
   }
@@ -456,11 +500,18 @@ export default function App() {
 
   // ── Join stops (and images) to poles ─────────────────────────────────────────
   const joinedStops = useMemo((): MissionStop[] => {
-    if (!missionStops.length || !polesIndex?.length || !poleGrid) return missionStops;
+    if (!missionStops.length || !polesIndex?.length || !poleGrid) {
+      // Still compute inventory even without poles
+      return missionStops.map(stop => ({
+        ...stop,
+        ...computeStopInventory(stop, effectiveImagesPerStop, catMap),
+      }));
+    }
     const lat0 = polesIndex.reduce((s, p) => s + p.lat, 0) / polesIndex.length;
     const proj = buildProjector(lat0);
 
     return missionStops.map(stop => {
+      const inventory = computeStopInventory(stop, effectiveImagesPerStop, catMap);
       const xy = proj.toXY(stop.lat, stop.lon);
       let cands = gridCandidates(poleGrid, xy.x, xy.y, Math.max(300, maxJoinM * 6));
       if (!cands.length) cands = polesIndex;
@@ -468,15 +519,15 @@ export default function App() {
         .map(p => ({ p, d: haversineM(stop.lat, stop.lon, p.lat, p.lon) }))
         .sort((a, b) => a.d - b.d);
       const best = scored[0];
-      if (!best || best.d > maxJoinM) return stop;
+      if (!best || best.d > maxJoinM) return { ...stop, ...inventory };
       const updatedImages = stop.images.map(img => ({
         ...img, poleKey: best.p.poleKey, assetId: best.p.assetId,
         joinDistM: haversineM(img.lat!, img.lon!, best.p.lat, best.p.lon),
         joinMethod: "gps" as const,
       }));
-      return { ...stop, poleKey: best.p.poleKey, assetId: best.p.assetId, joinDistM: best.d, images: updatedImages };
+      return { ...stop, ...inventory, poleKey: best.p.poleKey, assetId: best.p.assetId, joinDistM: best.d, images: updatedImages };
     });
-  }, [missionStops, polesIndex, poleGrid, maxJoinM]);
+  }, [missionStops, polesIndex, poleGrid, maxJoinM, effectiveImagesPerStop, catMap]);
 
   // Apply manual overrides to individual images
   const joinedImages = useMemo((): ImageRecord[] => {
@@ -509,41 +560,18 @@ export default function App() {
       const asset = map.get(stop.poleKey);
       if (!asset) continue;
       asset.stops.push(stop);
-
-      // If we know the expected images per stop, only use the first N images
-      // (ordered by timestamp) for inventory — extras are likely duplicate passes
-      const expectedN = effectiveImagesPerStop;
-      const imagesToCount = expectedN && expectedN > 0
-        ? [...stop.images].sort((a, b) => (a.cocoImage.date_captured ?? 0) - (b.cocoImage.date_captured ?? 0)).slice(0, expectedN)
-        : stop.images;
-
       for (const img of stop.images) asset.images.push(img);
 
-      // Inventory (deduped) uses only the canonical image set
-      const perImg: Record<string, number> = {};
-      for (const img of imagesToCount) {
-        const imgCounts: Record<string, number> = {};
-        for (const ann of img.annotations) {
-          const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
-          imgCounts[name] = (imgCounts[name] ?? 0) + 1;
-          asset.detectionTotals[name] = (asset.detectionTotals[name] ?? 0) + 1;
-        }
-        for (const [k, v] of Object.entries(imgCounts))
-          perImg[k] = Math.max(perImg[k] ?? 0, v);
-      }
-      // Also tally raw totals from ALL images (even extras)
-      for (const img of stop.images) {
-        if (imagesToCount.includes(img)) continue; // already counted above
-        for (const ann of img.annotations) {
-          const name = catMap.get(ann.category_id) ?? `cat_${ann.category_id}`;
-          asset.detectionTotals[name] = (asset.detectionTotals[name] ?? 0) + 1;
-        }
-      }
-      for (const [k, v] of Object.entries(perImg))
+      // Asset inventory = max across stops (same component seen from 2 stops = still 1 component)
+      for (const [k, v] of Object.entries(stop.inventoryCounts))
         asset.inventoryCounts[k] = Math.max(asset.inventoryCounts[k] ?? 0, v);
+
+      // Raw totals = sum across stops
+      for (const [k, v] of Object.entries(stop.detectionTotals))
+        asset.detectionTotals[k] = (asset.detectionTotals[k] ?? 0) + v;
     }
     return map;
-  }, [polesIndex, joinedStops, catMap, effectiveImagesPerStop]);
+  }, [polesIndex, joinedStops]);
 
   const assetsList = useMemo(() => Array.from(assetsMap.values())
     .sort((a, b) => {
@@ -863,7 +891,8 @@ export default function App() {
                 const active = selectedStopKey === stop.key;
                 const matched = !!stop.poleKey;
                 const imgCount = stop.images.length;
-                const detCount = stop.images.reduce((s, r) => s + r.annotations.length, 0);
+                const compCount = Object.values(stop.inventoryCounts).reduce((s, v) => s + v, 0);
+                const faultCount = Object.entries(stop.inventoryCounts).filter(([k]) => k.includes(".")).reduce((s, [, v]) => s + v, 0);
                 return (
                   <button key={stop.key}
                     onClick={() => { setSelectedStopKey(stop.key); setSelectedPoleKey(null); setSelectedImage(null); setSelectedUnassigned(null); }}
@@ -874,13 +903,13 @@ export default function App() {
                         {stop.poleKey && <span style={{ fontWeight: 400, color: C.dim }}> · {stop.assetId}</span>}
                       </span>
                       <span style={{ fontFamily: MONO, fontSize: 9, color: matched ? C.accent : C.warn, background: matched ? "rgba(0,168,114,.1)" : "rgba(212,130,10,.1)", padding: "2px 6px", borderRadius: 2 }}>
-                        {matched ? `${fmtM(stop.joinDistM)}` : "unmatched"}
+                        {matched ? fmtM(stop.joinDistM) : "unmatched"}
                       </span>
                     </div>
                     <div style={{ display: "flex", gap: 10, fontFamily: MONO, fontSize: 9, color: C.dim }}>
                       <span>{imgCount} img</span>
-                      <span>{detCount} det</span>
-                      <span>{stop.lat.toFixed(5)}, {stop.lon.toFixed(5)}</span>
+                      <span style={{ color: C.accent }}>{compCount} comp</span>
+                      {faultCount > 0 && <span style={{ color: C.warn }}>{faultCount} fault</span>}
                     </div>
                     {stop.aiAppIds.length > 0 && (
                       <div style={{ marginTop: 3, fontFamily: MONO, fontSize: 8, color: C.info, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -1035,18 +1064,25 @@ export default function App() {
                 </div>
 
                 {/* Stop summary */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, padding: "10px 12px", borderBottom: `1px solid ${C.b1}` }}>
-                  {[
-                    ["Images", selectedStop.images.length],
-                    ["Detections", selectedStop.images.reduce((s, r) => s + r.annotations.length, 0)],
-                    ["Join dist", fmtM(selectedStop.joinDistM)]
-                  ].map(([l, v]) => (
-                    <div key={String(l)} style={{ background: C.s2, borderRadius: 3, padding: "6px 8px" }}>
-                      <div style={{ ...monoLabel(8), marginBottom: 2 }}>{l}</div>
-                      <div style={{ fontFamily: MONO, fontSize: 15, fontWeight: 700 }}>{v}</div>
+                {(() => {
+                  const invTotal = Object.values(selectedStop.inventoryCounts).reduce((s, v) => s + v, 0);
+                  const faultTotal = Object.entries(selectedStop.inventoryCounts).filter(([k]) => k.includes(".")).reduce((s, [, v]) => s + v, 0);
+                  const rawTotal = Object.values(selectedStop.detectionTotals).reduce((s, v) => s + v, 0);
+                  return (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, padding: "10px 12px", borderBottom: `1px solid ${C.b1}` }}>
+                      {[
+                        ["Images", `${selectedStop.canonicalImageCount}${selectedStop.images.length > selectedStop.canonicalImageCount ? ` of ${selectedStop.images.length}` : ""}`],
+                        ["Components", invTotal],
+                        ["Faults", faultTotal],
+                      ].map(([l, v]) => (
+                        <div key={String(l)} style={{ background: C.s2, borderRadius: 3, padding: "6px 8px" }}>
+                          <div style={{ ...monoLabel(8), marginBottom: 2 }}>{l}</div>
+                          <div style={{ fontFamily: MONO, fontSize: 15, fontWeight: 700, color: l === "Faults" && Number(v) > 0 ? C.warn : C.text }}>{v}</div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  );
+                })()}
 
                 {/* Profile vs actual image count */}
                 {effectiveMissionProfile && (
@@ -1072,8 +1108,54 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Profile */}
-                {selectedStop.aiAppIds.length > 0 && (
+                {/* ── COMPONENT INVENTORY TABLE ───────────────────────── */}
+                <div style={{ padding: "10px 14px", borderBottom: `1px solid ${C.b1}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <span style={monoLabel()}>Asset Profile — Deduped Inventory</span>
+                    <span style={{ fontFamily: MONO, fontSize: 9, color: C.muted }}>
+                      max/img × {selectedStop.canonicalImageCount} imgs
+                    </span>
+                  </div>
+                  {Object.keys(selectedStop.inventoryCounts).length === 0 ? (
+                    <div style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>No detections</div>
+                  ) : (
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr style={{ borderBottom: `1px solid ${C.b1}` }}>
+                          <th style={{ ...monoLabel(8), textAlign: "left", padding: "3px 0", fontWeight: 500 }}>Component</th>
+                          <th style={{ ...monoLabel(8), textAlign: "right", padding: "3px 0", fontWeight: 500, width: 32 }}>Qty</th>
+                          <th style={{ ...monoLabel(8), textAlign: "right", padding: "3px 0", fontWeight: 500, width: 48 }}>Raw</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(selectedStop.inventoryCounts)
+                          .sort((a, b) => {
+                            // Faults last, then sort by count desc
+                            const aF = a[0].includes("."), bF = b[0].includes(".");
+                            if (aF !== bF) return aF ? 1 : -1;
+                            return b[1] - a[1];
+                          })
+                          .map(([cat, cnt]) => {
+                            const isFault = cat.includes(".");
+                            const raw = selectedStop.detectionTotals[cat] ?? cnt;
+                            return (
+                              <tr key={cat} style={{ borderBottom: `1px solid ${C.s2}` }}>
+                                <td style={{ padding: "4px 0", fontFamily: MONO, fontSize: 10, color: isFault ? C.warn : C.text }}>
+                                  {isFault
+                                    ? <><span style={{ color: C.dim }}>{cat.split(".")[0]}</span><span style={{ color: C.warn }}>{"." + cat.split(".").slice(1).join(".")}</span></>
+                                    : cat}
+                                </td>
+                                <td style={{ padding: "4px 0", textAlign: "right", fontFamily: MONO, fontSize: 12, fontWeight: 700, color: isFault ? C.warn : C.accent, width: 32 }}>{cnt}</td>
+                                <td style={{ padding: "4px 0", textAlign: "right", fontFamily: MONO, fontSize: 9, color: C.muted, width: 48 }}>
+                                  {raw > cnt ? <span title="Raw total across all images">{raw}</span> : <span style={{ opacity: .3 }}>—</span>}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
                   <div style={{ padding: "8px 14px", borderBottom: `1px solid ${C.b1}` }}>
                     <div style={{ ...monoLabel(), marginBottom: 5 }}>Inspect Profiles</div>
                     {selectedStop.aiAppIds.map(id => (
